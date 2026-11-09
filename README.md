@@ -64,17 +64,14 @@ match: the bridge deletes that bond and pairs again by itself.
 
 ## Status LED
 
-A short flash every 2 s shows the state; a second, **long** flash (0.5 s) shows the last error.
+| LED | Meaning |
+|---|---|
+| Short **green** flash every 2 s | firmware running, keyboard not connected (scanning) |
+| Solid **blue** | keyboard connected, secured and active |
+| Solid red / magenta at boot | waiting for the USB host / starting Bluetooth (normally under a second or two) |
 
-| Colour | State (short flash) | Colour | Last error (long flash) |
-|---|---|---|---|
-| Blue | scanning | Red | HID service not found |
-| Yellow | keyboard found | Magenta | keyboard closed the link |
-| Cyan | connected, pairing | White | closed by the bridge |
-| Green | secured and active | Green / Yellow / Blue | timeout / connect failed / other |
-| | | Cyan | stale bond deleted, retrying |
-
-While you type: solid **blue** = keyboard report received, **magenta** = trackpad, **red** = report received but USB not ready.
+For the detailed debug colours (state colour plus a long error flash, activity colours while typing), build with `-DLED_DEBUG`
+(`--build-property "compiler.cpp.extra_flags=-DLED_DEBUG"`). The sketch also logs connection events (addresses, disconnect reasons) on the USB serial port.
 
 ## Hardware
 
@@ -126,7 +123,7 @@ arduino-cli upload -p COMx --fqbn Seeeduino:nrf52:xiaonRF52840:softdevice=s140v6
 ### Pairing
 
 Put the keyboard channel in pairing mode and power the bridge: it connects by itself (green flashes).
-Each keyboard channel is paired once; afterwards it reconnects when the keyboard wakes (reconnect without pairing mode is still to be verified).
+Each keyboard channel is paired once; afterwards it reconnects by itself when the keyboard wakes (verified on Windows after closing the keyboard, changing channel and unplugging the board).
 If you re-pair a channel, the bridge discards its stale bond and pairs again automatically (cyan long flash).
 
 ### Troubleshooting
@@ -165,7 +162,7 @@ Double-tap RESET first so the board is in bootloader mode.
 |---|---|
 | Windows 11: typing, trackpad, Fn+F1..F12 media keys | works |
 | Reconnect after keyboard re-enters pairing mode | implemented, only partly verified (Windows) |
-| Reconnect after power cycle without pairing mode | to verify |
+| Reconnect without pairing mode (keyboard closed, channel change, board replug) | works (Windows) |
 | Old Linux (Slackware), new Linux | **untested** (standard boot HID, expected to work) |
 | BIOS/UEFI | **untested** (the CDC interface comes first; a release build without CDC would be safer) |
 

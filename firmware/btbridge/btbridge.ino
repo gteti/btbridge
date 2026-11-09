@@ -81,17 +81,46 @@ static void blink(int n) { for (int i = 0; i < n; i++) flash(GREEN, 200, 300); }
 // Stato mostrato dal LED (n lampi ogni 3 s): 1 scansione senza adv, 2 (non usato),
 // 3 adv HID visto/connessione, 4 connesso, 5 sicuro e notifiche attive.
 static volatile uint8_t st = 1, why = 0;  // why: ultima causa di fallimento (debug LED)
-static void scanCb(ble_gap_evt_adv_report_t* r) { st = 3; Bluefruit.Central.connect(r); }
+static volatile uint32_t t3 = 0, t4 = 0;
+static volatile uint8_t fails = 0;  // tentativi di sicurezza falliti di fila: il bond si cancella solo al 2o
+// Il SoftDevice mette in pausa la scansione dopo ogni report: se la connessione non parte
+// (o non si completa) la scansione non riprende da sola, quindi si gestisce qui e nel loop.
+static ble_gap_addr_t lastAddr; static bool haveLast = false;  // ultima tastiera collegata
+#ifdef LED_DEBUG
+#define DBG(...) Serial.printf(__VA_ARGS__)
+#else
+#define DBG(...) ((void)0)
+#endif
+static void dbgAddr(const char* tag, const ble_gap_addr_t& a) {
+  DBG("%s %02X:%02X:%02X:%02X:%02X:%02X type=%d\n", tag, a.addr[5], a.addr[4], a.addr[3], a.addr[2], a.addr[1], a.addr[0], a.addr_type);
+}
+// Non si filtra piu' solo sul servizio HID: una tastiera gia' accoppiata che si risveglia puo' fare
+// advertising senza UUID (o diretto). Si accetta: servizio HID, advertising diretto, o l'ultimo indirizzo.
+static void scanCb(ble_gap_evt_adv_report_t* r) {
+  if (Bluefruit.Central.connected() || st >= 3) return;  // gia' in connessione
+  bool same = haveLast && r->peer_addr.addr_type == lastAddr.addr_type && !memcmp(r->peer_addr.addr, lastAddr.addr, 6);
+  bool hid = Bluefruit.Scanner.checkReportForService(r, hidSvc);
+  if (!(hid || same || r->type.directed)) { Bluefruit.Scanner.resume(); return; }
+  dbgAddr(same ? "adv last" : hid ? "adv hid" : "adv direct", r->peer_addr);
+  st = 3; t3 = millis();
+  if (!Bluefruit.Central.connect(r)) { st = 1; Bluefruit.Scanner.resume(); }
+}
 
-static volatile uint32_t t4 = 0;
 static void connectCb(uint16_t h) {
   st = 4; t4 = millis();
-  Bluefruit.Connection(h)->requestPairing();
+  BLEConnection* c = Bluefruit.Connection(h);
+  // Con un bond salvato Bluefruit cifra gia' da solo con la chiave (BLECentral): chiedere anche
+  // un nuovo pairing farebbe rifiutare la tastiera se non e' in modo pairing. Solo senza bond.
+  bond_keys_t k;
+  bool bonded = c->loadBondKey(&k);
+  DBG("connected bonded=%d\n", bonded);
+  dbgAddr("connected", c->getPeerAddr());
+  if (!bonded) c->requestPairing();
 }
 
 static void securedCb(uint16_t h) {
   BLEConnection* c = Bluefruit.Connection(h);
-  if (!c->secured()) { c->removeBondKey(); why = 7; c->disconnect(); return; }
+  if (!c->secured()) { if (++fails >= 2) { c->removeBondKey(); why = 7; fails = 0; } else why = 6; c->disconnect(); return; }
   if (!hidSvc.discover(h)) { why = 1; c->disconnect(); return; }
   BLEClientCharacteristic* chr[NREP];
   for (int i = 0; i < NREP; i++) chr[i] = &rep[i];
@@ -103,8 +132,9 @@ static void securedCb(uint16_t h) {
     if (rep[i].enableNotify()) n++;
   }
   if (!n) { why = 1; c->disconnect(); return; }
-  st = 5; why = 0;
-  blink(n);  // n = report con notifiche attive (attesi 3: tastiera, consumer, mouse)
+  c->requestConnectionParameter(12, 0, 400);  // ora che e' sveglia: 15 ms per il trackpad
+  lastAddr = c->getPeerAddr(); haveLast = true;  // si ricorda solo una tastiera che ha funzionato davvero
+  st = 5; why = 0; fails = 0;  // n = report con notifiche attive (attesi 3: tastiera, consumer, mouse)
 }
 
 static void releaseAll() {  // al disconnect: niente tasti/pulsanti bloccati
@@ -113,7 +143,7 @@ static void releaseAll() {  // al disconnect: niente tasti/pulsanti bloccati
   if (usbKbd.ready()) usbKbd.sendReport(0, z8, 8);
   if (usbMouse.ready()) usbMouse.sendReport(0, z4, 4);
 }
-static void disconnectCb(uint16_t, uint8_t reason) { if (!why) why = reason == 0x13 ? 2 : reason == 0x16 ? 3 : reason == 0x08 ? 4 : reason == 0x3E ? 5 : 6; st = 1; kt = kh; mt = mh; ct = ch; releaseAll(); }
+static void disconnectCb(uint16_t, uint8_t reason) { DBG("disconnected reason=0x%02X st=%d\n", reason, st); if (!why) why = reason == 0x13 ? 2 : reason == 0x16 ? 3 : reason == 0x08 ? 4 : reason == 0x3E ? 5 : 6; st = 1; kt = kh; mt = mh; ct = ch; releaseAll(); }
 
 void setup() {
   pinMode(LED_RED, OUTPUT); pinMode(LED_GREEN, OUTPUT); pinMode(LED_BLUE, OUTPUT); rgb(0);
@@ -136,10 +166,9 @@ void setup() {
   usbCons.setPollInterval(4);
   usbCons.setReportDescriptor(cons_desc, sizeof(cons_desc));
   usbCons.begin();
-  flash(RED);  // stadio A: interfacce USB registrate
+  rgb(RED);  // rosso fisso: in attesa che l'host enumeri (nessun ritardo inutile)
   uint32_t t0 = millis();
-  while (!TinyUSBDevice.mounted() && millis() - t0 < 15000) delay(10);
-  flash(GREEN);  // stadio B: USB attesa finita
+  while (!TinyUSBDevice.mounted() && millis() - t0 < 15000) delay(1);
 
 #ifdef NO_BLE
   flash(TinyUSBDevice.mounted() ? WHITE : RED);  // solo test USB
@@ -147,8 +176,7 @@ void setup() {
 #endif
   rgb(5);  // magenta fisso = dentro Bluefruit.begin(); se resta acceso, e' bloccato
   bool ok = Bluefruit.begin(1, 1);
-  rgb(0); delay(300);
-  flash(ok ? BLUE : YELLOW);  // stadio C: BLU = begin ok, GIALLO = begin fallito
+  if (!ok) { rgb(YELLOW); delay(3000); }  // giallo = begin fallito
   Bluefruit.autoConnLed(false);  // il LED lo gestiamo noi (heartbeat)
   Bluefruit.setName("btbridge");
   hidSvc.begin();
@@ -157,21 +185,27 @@ void setup() {
   Bluefruit.Security.setSecuredCallback(securedCb);
   // tastiera ri-accoppiata (modo pairing): chiave vecchia -> cancella il bond e riprova pulito
   Bluefruit.Security.setPairCompleteCallback([](uint16_t h, uint8_t status) {
-    if (status != BLE_GAP_SEC_STATUS_SUCCESS) { BLEConnection* c = Bluefruit.Connection(h); c->removeBondKey(); why = 7; c->disconnect(); }
+    if (status != BLE_GAP_SEC_STATUS_SUCCESS) { BLEConnection* c = Bluefruit.Connection(h); if (++fails >= 2) { c->removeBondKey(); why = 7; fails = 0; } else why = 6; c->disconnect(); }
   });
   Bluefruit.Central.setConnectCallback(connectCb);
   Bluefruit.Central.setDisconnectCallback(disconnectCb);
   Bluefruit.Scanner.setRxCallback(scanCb);
   Bluefruit.Scanner.restartOnDisconnect(true);
-  Bluefruit.Scanner.setInterval(160, 80);
-  Bluefruit.Scanner.filterService(hidSvc);  // solo dispositivi con servizio HID
+  // reconnect: 0x3E = la tastiera non risponde al primo evento (7.5 ms troppo stretto da dormiente)
+  Bluefruit.Central.setConnInterval(80, 160);  // 100-200 ms all'aggancio, poi veloce (securedCb)
+  Bluefruit.Scanner.setInterval(160, 160);  // scansione continua: trova la tastiera subito
   Bluefruit.Scanner.useActiveScan(false);
   Bluefruit.Scanner.start(0);
-  flash(WHITE);  // stadio D: avvio completato, poi heartbeat
 }
 
 // Heartbeat: lampo di 150 ms ogni 2 s, colore = stato:
 // blu scansione, giallo HID trovato, ciano connesso, verde sicuro e attivo.
+#ifndef LED_DEBUG
+static void heartbeat() {  // verde: lampo breve ogni 2 s = firmware in funzione; blu fisso = tastiera connessa e attiva
+  if (st == 5) { rgb(BLUE); return; }
+  rgb((millis() % 2000) < 100 ? GREEN : 0);
+}
+#else
 static void heartbeat() {
   static const uint8_t col[6] = {0, BLUE, BLUE, YELLOW, CYAN, GREEN};
   // secondo lampo LUNGO (500 ms, il primo e' breve) = ultimo errore: rosso discover HID fallita, magenta tastiera
@@ -181,20 +215,29 @@ static void heartbeat() {
   uint32_t t = millis() % 2000;
   rgb(t < 150 ? col[st] : (t >= 600 && t < 1100 && why) ? wc[why] : 0);
 }
+#endif
 
 void loop() {
   // debug: 300 ms di luce fissa quando arriva un report BLE: blu = tastiera, magenta = mouse,
   // rosso = report in coda ma USB non pronta
   static uint32_t pk = 0, pm = 0, until = 0, col = 0;
+#ifdef LED_DEBUG
   if (rxK != pk) { pk = rxK; until = millis() + 300; col = BLUE; }
   if (rxM != pm) { pm = rxM; until = millis() + 300; col = 5; }
   if ((kt != kh && !usbKbd.ready()) || (mt != mh && !usbMouse.ready())) { until = millis() + 300; col = RED; }
+#endif
   if ((int32_t)(until - millis()) > 0) rgb(col); else heartbeat();
-  // connesso ma non sicuro da 6 s (bond obsoleto, nessun evento): cancella bond e riparti
+  // connessione mai partita (tastiera tornata a dormire dopo l'adv): annulla e riprendi la scansione
+  if (st == 3 && millis() - t3 > 3000 && !Bluefruit.Central.connected()) {
+    sd_ble_gap_connect_cancel();
+    st = 1; why = 5;
+    Bluefruit.Scanner.start(0);
+  }
+  // connesso ma non sicuro da 6 s (bond obsoleto, nessun evento): disconnetti; il bond si cancella al 2o tentativo
   if (st == 4 && millis() - t4 > 6000) {
-    st = 1; why = 7; t4 = millis();
-    uint8_t n = Bluefruit.Central.connected();
-    for (uint16_t h = 0; h < 4 && n; h++) { BLEConnection* c = Bluefruit.Connection(h); if (c && c->connected()) { c->removeBondKey(); c->disconnect(); } }
+    st = 1; t4 = millis();
+    bool del = ++fails >= 2; if (del) { fails = 0; why = 7; } else why = 6;
+    for (uint16_t h = 0; h < 4; h++) { BLEConnection* c = Bluefruit.Connection(h); if (c && c->connected()) { if (del) c->removeBondKey(); c->disconnect(); } }
   }
   while (ct != ch) {
     if (!usbCons.ready()) break;
